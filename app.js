@@ -1,29 +1,53 @@
 // Видеозвонок 1 на 1 без своего сервера.
-// Браузеры находят друг друга через публичный сервер PeerJS (он пересылает только
-// служебные сообщения), дальше видео и звук идут напрямую между браузерами.
 //
-// Комната = адрес вида ?room=abc. Кто зашёл первым, занимает имя комнаты и ждёт,
-// второй звонит ему. Если первый ушёл, оставшийся сам занимает комнату.
+// Как браузеры находят друг друга: через несколько бесплатных публичных MQTT-серверов
+// сразу (если один недоступен, работают остальные). Через них идут только короткие
+// служебные сообщения, зашифрованные ключом из ссылки на комнату. Серверы видят
+// лишь непонятный шифр. Видео и звук идут напрямую между браузерами.
+//
+// Комната нигде не хранится: это просто общий «канал» по имени из ссылки.
+// Пока в нём кто-то есть, комната существует; все вышли — от неё ничего не осталось.
 
 const $ = id => document.getElementById(id);
 const CFG = window.CALL_CONFIG || {};
-const PREFIX = 'p2pcall-v1-';
+
+const BROKERS = CFG.brokers || [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+  'wss://test.mosquitto.org:8081/mqtt',
+  'wss://mqtt.eclipseprojects.io:443/mqtt',
+];
+
+const ICE_SERVERS = CFG.iceServers || [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+  // Бесплатный ретранслятор (TURN) от проекта PeerJS — для сетей, где напрямую не соединиться.
+  { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
+];
+
 const roomId = new URLSearchParams(location.search).get('room');
+const myId = randomId(12);
 
 const state = {
-  peer: null,
-  call: null,
-  isHost: false,
-  gotStream: false,
-  failed: false,
-  leaving: false,
-  localStream: null, // то, что реально дала камера/микрофон
+  clients: [],          // подключения к MQTT-серверам
+  connectedCount: 0,
+  topic: null,
+  key: null,
+  seen: new Set(),      // одно сообщение приходит через несколько серверов — отбрасываем повторы
+  queue: Promise.resolve(),
+  helloTimer: null,
+
+  peerId: null,
+  pc: null,
+  pendingCandidates: [],
+  senders: {},
+  connectTimer: null,
+  disconnectTimer: null,
+  stopped: false,       // вышли из звонка или комната занята
+
+  localStream: null,
   camTrack: null,
   micTrack: null,
-  blankVideo: null,  // заглушки, если устройства нет: канал создаётся всегда,
-  silentAudio: null, // чтобы потом можно было включить демонстрацию экрана
   screenTrack: null,
-  disconnectTimer: null,
 };
 
 // ---------- Экран входа ----------
@@ -34,33 +58,32 @@ if (roomId) {
   $('createBtn').hidden = true;
   $('joinBtn').hidden = false;
   $('newRoomLink').hidden = false;
-  $('lobbyText').textContent = `Комната ${roomId}. Камера и микрофон включатся после входа.`;
+  $('lobbyText').textContent = 'Вас пригласили в звонок. Камера и микрофон включатся после входа.';
 }
 
-$('createBtn').onclick = () => {
-  location.search = '?room=' + randomId();
-};
+$('createBtn').onclick = () => { location.search = '?room=' + randomId(10); };
 $('joinBtn').onclick = enterRoom;
 $('rejoinBtn').onclick = () => location.reload();
+$('newCallBtn').onclick = () => { location.href = location.pathname + '?room=' + randomId(10); };
 
-function randomId() {
+function randomId(len) {
   const alphabet = 'abcdefghijkmnpqrstuvwxyz23456789';
-  const bytes = crypto.getRandomValues(new Uint8Array(10));
+  const bytes = crypto.getRandomValues(new Uint8Array(len));
   return Array.from(bytes, b => alphabet[b % alphabet.length]).join('');
 }
 
 async function enterRoom() {
-  if (typeof Peer === 'undefined') {
-    toast('Не загрузился файл peerjs.min.js — проверьте, что он лежит рядом с index.html');
-    return;
+  if (typeof mqtt === 'undefined') {
+    return toast('Не загрузился файл mqtt.min.js — проверьте, что он лежит рядом с index.html');
+  }
+  if (!crypto.subtle) {
+    return toast('Нужен HTTPS: откройте сервис по адресу https://…');
   }
   $('joinBtn').disabled = true;
 
   state.localStream = await getLocalMedia();
   state.camTrack = state.localStream.getVideoTracks()[0] || null;
   state.micTrack = state.localStream.getAudioTracks()[0] || null;
-  if (!state.camTrack) state.blankVideo = makeBlankVideo();
-  if (!state.micTrack) state.silentAudio = makeSilentAudio();
 
   showLocal(state.localStream, true);
   updateButtons();
@@ -68,7 +91,8 @@ async function enterRoom() {
   $('call').hidden = false;
   $('shareInput').value = location.href;
 
-  joinRoom();
+  await initCrypto();
+  connectBrokers();
 }
 
 async function getLocalMedia() {
@@ -86,189 +110,274 @@ async function getLocalMedia() {
   return new MediaStream();
 }
 
-function makeBlankVideo() {
-  const c = document.createElement('canvas');
-  c.width = 640; c.height = 360;
-  const ctx = c.getContext('2d');
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, c.width, c.height);
-  return c.captureStream(1).getVideoTracks()[0];
+// ---------- Шифрование служебных сообщений ----------
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+async function sha256(text) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(text)));
 }
 
-function makeSilentAudio() {
-  try {
-    const ac = new AudioContext();
-    return ac.createMediaStreamDestination().stream.getAudioTracks()[0];
-  } catch { return null; }
+async function initCrypto() {
+  const h = await sha256('p2pcall-topic:' + roomId);
+  state.topic = 'p2pcall/v2/' + Array.from(h.slice(0, 16), b => b.toString(16).padStart(2, '0')).join('');
+  state.key = await crypto.subtle.importKey('raw', await sha256('p2pcall-key:' + roomId), 'AES-GCM', false, ['encrypt', 'decrypt']);
 }
 
-function outgoingStream() {
-  const tracks = [state.micTrack || state.silentAudio, currentVideoTrack()].filter(Boolean);
-  return new MediaStream(tracks);
+async function encrypt(obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, state.key, enc.encode(JSON.stringify(obj))));
+  const out = new Uint8Array(12 + data.length);
+  out.set(iv);
+  out.set(data, 12);
+  return out;
 }
 
-function currentVideoTrack() {
-  return state.screenTrack || state.camTrack || state.blankVideo;
+async function decrypt(bytes) {
+  const u = new Uint8Array(bytes);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u.slice(0, 12) }, state.key, u.slice(12));
+  return JSON.parse(dec.decode(plain));
 }
 
-// ---------- Подключение ----------
+// ---------- Серверы связи (MQTT) ----------
 
-function peerOptions() {
-  const opts = { ...(CFG.peerServer || {}) };
-  if (CFG.iceServers) opts.config = { iceServers: CFG.iceServers };
-  return opts;
-}
-
-// Пытаемся занять имя комнаты. Если занято — значит, там уже ждут, звоним им.
-function joinRoom() {
-  if (state.leaving) return;
+function connectBrokers() {
   setStatus('Подключаемся…');
-  const peer = new Peer(PREFIX + roomId, peerOptions());
-  state.peer = peer;
+  BROKERS.forEach((url, i) => {
+    let client;
+    try {
+      client = mqtt.connect(url, {
+        clientId: `pc_${myId}_${i}`,
+        clean: true,
+        keepalive: 30,
+        reconnectPeriod: 4000,
+        connectTimeout: 8000,
+        protocolVersion: 4,
+      });
+    } catch { return; }
 
-  peer.on('open', () => {
-    state.isHost = true;
-    if (!state.call) setStatus('Ждём собеседника. Отправьте ему ссылку:', true);
-  });
-
-  peer.on('call', incoming => {
-    if (state.call) { rejectBusy(incoming); return; } // уже идёт звонок — третьего не пускаем
-    attachCall(incoming);
-    incoming.answer(outgoingStream());
-  });
-
-  peer.on('error', err => {
-    if (err.type === 'unavailable-id') {
-      peer.destroy();
-      callHost();
-    } else {
-      handlePeerError(err);
-    }
-  });
-
-  peer.on('disconnected', () => {
-    if (!state.leaving && !peer.destroyed) peer.reconnect();
-  });
-}
-
-function callHost() {
-  if (state.leaving) return;
-  const peer = new Peer(peerOptions());
-  state.peer = peer;
-  state.isHost = false;
-
-  peer.on('open', () => {
-    const call = peer.call(PREFIX + roomId, outgoingStream());
-    attachCall(call);
-    // Если за 25 секунд так и не соединились — сообщаем, а не висим молча.
-    setTimeout(() => {
-      if (state.call === call && !state.gotStream) {
-        state.failed = true;
-        call.close();
-        onCallEnded(call);
-      }
-    }, 25000);
-  });
-
-  // Хозяин комнаты может ответить «занято».
-  peer.on('connection', conn => {
-    conn.on('data', msg => {
-      if (msg?.type === 'busy') showBusy();
-      conn.close();
+    client.isUp = false;
+    client.on('connect', () => {
+      client.subscribe(state.topic, { qos: 0 }, err => {
+        if (err) return;
+        client.isUp = true;
+        updateNetInfo();
+        sendHello(); // сразу заявляем о себе
+      });
     });
+    const down = () => { if (client.isUp) { client.isUp = false; updateNetInfo(); } };
+    client.on('close', down);
+    client.on('offline', down);
+    client.on('error', () => {});
+    client.on('message', (topic, payload) => onRawMessage(payload));
+    state.clients.push(client);
   });
 
-  peer.on('error', err => {
-    if (err.type === 'peer-unavailable') {
-      // Тот, кто ждал, уже ушёл — пробуем занять комнату сами.
-      state.call = null;
-      peer.destroy();
-      setTimeout(joinRoom, 1000);
-    } else {
-      handlePeerError(err);
+  // Раз в 4 секунды напоминаем о себе, пока ждём собеседника.
+  state.helloTimer = setInterval(() => { if (!state.peerId) sendHello(); }, 4000);
+
+  setTimeout(() => {
+    if (!state.connectedCount && !state.stopped) {
+      setStatus('Не удаётся подключиться ни к одному серверу связи. Проверьте интернет или попробуйте другую сеть (Wi-Fi / мобильный).');
     }
-  });
+  }, 12000);
 }
 
-function rejectBusy(incoming) {
-  const conn = state.peer.connect(incoming.peer);
-  conn.on('open', () => {
-    conn.send({ type: 'busy' });
-    setTimeout(() => conn.close(), 1000);
-  });
-  setTimeout(() => incoming.close(), 1500);
+function updateNetInfo() {
+  state.connectedCount = state.clients.filter(c => c.isUp).length;
+  $('netInfo').textContent = `Серверы связи: ${state.connectedCount} из ${BROKERS.length}`;
+  if (state.connectedCount && !state.peerId && !state.stopped) showWaiting();
+}
+
+async function publish(msg) {
+  if (!state.key) return;
+  const payload = await encrypt({ ...msg, from: myId, mid: randomId(10) });
+  for (const c of state.clients) if (c.isUp) c.publish(state.topic, payload, { qos: 0 });
+}
+
+function onRawMessage(payload) {
+  state.queue = state.queue.then(async () => {
+    let msg;
+    try { msg = await decrypt(payload); } catch { return; }
+    if (!msg || msg.from === myId || state.seen.has(msg.mid)) return;
+    state.seen.add(msg.mid);
+    if (msg.to && msg.to !== myId) return;
+    await handleMessage(msg);
+  }).catch(err => console.error(err));
+}
+
+function sendHello() {
+  if (!state.stopped) publish({ type: 'hello' });
+}
+
+// ---------- Логика комнаты ----------
+
+async function handleMessage(msg) {
+  if (state.stopped) return;
+
+  switch (msg.type) {
+    case 'hello':
+      if (msg.from === state.peerId) return;
+      if (state.peerId) {
+        // Уже разговариваем с другим — третьему отвечаем «занято».
+        publish({ type: 'busy', to: msg.from });
+        return;
+      }
+      adoptPeer(msg.from);
+      // Чтобы не было «столкновения», звонит тот, у кого id меньше.
+      if (myId < msg.from) await startOffer();
+      else sendHello();
+      return;
+
+    case 'signal':
+      if (!state.peerId) adoptPeer(msg.from);
+      if (msg.from !== state.peerId) return;
+      await handleSignal(msg.data);
+      return;
+
+    case 'busy':
+      if (!state.pc || state.pc.connectionState !== 'connected') showBusy();
+      return;
+
+    case 'bye':
+      if (msg.from === state.peerId) peerLeft();
+      return;
+  }
+}
+
+function adoptPeer(id) {
+  state.peerId = id;
+  setStatus('Собеседник подключается…');
+  clearTimeout(state.connectTimer);
+  state.connectTimer = setTimeout(() => {
+    if (state.pc?.connectionState !== 'connected') connectFailed();
+  }, 30000);
+}
+
+function peerLeft() {
+  closePeer();
+  state.peerId = null;
+  showWaiting('Собеседник вышел. Он может вернуться по той же ссылке:');
+  sendHello();
+}
+
+function connectFailed() {
+  closePeer();
+  state.peerId = null;
+  setStatus('Не удалось соединиться: сеть одного из вас блокирует звонок. Попробуйте другую сеть (например, мобильный интернет вместо Wi-Fi) и обновите страницу.');
+  state.stopped = true;
 }
 
 function showBusy() {
-  const call = state.call;
-  state.call = null;
-  state.leaving = true; // дальше не переподключаемся
-  call?.close();
-  state.peer?.destroy();
-  $('remoteVideo').srcObject = null;
+  closePeer();
+  state.peerId = null;
+  state.stopped = true;
+  disconnectBrokers();
   setStatus('В этой комнате уже идёт звонок. Создайте новую комнату.');
 }
 
-function handlePeerError(err) {
-  console.warn('PeerJS:', err.type, err);
-  if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
-    setStatus('Нет связи с сервером соединений. Проверьте интернет и обновите страницу.');
-  } else if (err.type === 'browser-incompatible') {
-    setStatus('Этот браузер не поддерживает видеозвонки. Попробуйте Chrome, Edge, Firefox или Safari.');
-  }
+function sendSignal(data) {
+  if (state.peerId) publish({ type: 'signal', to: state.peerId, data });
 }
 
-function attachCall(call) {
-  state.call = call;
-  state.gotStream = false;
-  state.failed = false;
+// ---------- WebRTC ----------
 
-  call.on('stream', stream => {
-    state.gotStream = true;
-    $('remoteVideo').srcObject = stream;
-    hideStatus();
-  });
-  call.on('close', () => onCallEnded(call));
-  call.on('error', () => onCallEnded(call));
+function createPeer() {
+  closePeer();
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  state.pc = pc;
+  state.pendingCandidates = [];
+  state.senders = {};
 
-  const pc = call.peerConnection;
-  pc?.addEventListener('connectionstatechange', () => {
-    if (call !== state.call) return;
+  const remote = new MediaStream();
+  pc.ontrack = e => {
+    remote.addTrack(e.track);
+    $('remoteVideo').srcObject = remote;
+  };
+  pc.onicecandidate = e => {
+    if (e.candidate) sendSignal({ candidate: e.candidate.toJSON() });
+  };
+  pc.onconnectionstatechange = () => {
+    if (pc !== state.pc) return;
     clearTimeout(state.disconnectTimer);
     switch (pc.connectionState) {
       case 'connected':
-        if (state.gotStream) hideStatus();
+        clearTimeout(state.connectTimer);
+        hideStatus();
         break;
       case 'disconnected':
         setStatus('Связь прервалась, пробуем восстановить…');
-        // Если собеседник закрыл вкладку, связь сама не вернётся.
-        state.disconnectTimer = setTimeout(() => call.close(), 8000);
+        state.disconnectTimer = setTimeout(peerLeft, 8000); // собеседник, скорее всего, закрыл вкладку
         break;
       case 'failed':
-        state.failed = true;
-        call.close();
+        connectFailed();
         break;
     }
-  });
+  };
+  return pc;
 }
 
-function onCallEnded(call) {
-  if (call !== state.call) return;
-  clearTimeout(state.disconnectTimer);
-  state.call = null;
-  $('remoteVideo').srcObject = null;
-  if (state.leaving) return;
+function currentVideoTrack() {
+  return state.screenTrack || state.camTrack;
+}
 
-  if (state.failed) {
-    setStatus('Не удалось соединиться напрямую: сеть блокирует звонок. Попробуйте другую сеть или свой TURN-сервер (см. README).');
+async function startOffer() {
+  const pc = createPeer();
+  const audio = state.micTrack;
+  const video = currentVideoTrack();
+  // Каналы создаём даже без устройств — чтобы потом можно было включить экран.
+  state.senders.audio = pc.addTransceiver(audio || 'audio', { direction: 'sendrecv', streams: [state.localStream] }).sender;
+  state.senders.video = pc.addTransceiver(video || 'video', { direction: 'sendrecv', streams: [state.localStream] }).sender;
+  await pc.setLocalDescription(await pc.createOffer());
+  sendSignal({ description: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
+}
+
+async function handleSignal(data) {
+  if (data.description) {
+    const desc = data.description;
+    if (desc.type === 'offer') {
+      const pc = createPeer();
+      await pc.setRemoteDescription(desc);
+      for (const t of pc.getTransceivers()) {
+        const kind = t.receiver.track.kind;
+        const track = kind === 'audio' ? state.micTrack : currentVideoTrack();
+        t.direction = 'sendrecv';
+        if (track) await t.sender.replaceTrack(track);
+        if (t.sender.setStreams) t.sender.setStreams(state.localStream);
+        state.senders[kind] = t.sender;
+      }
+      await pc.setLocalDescription(await pc.createAnswer());
+      sendSignal({ description: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
+    } else if (desc.type === 'answer' && state.pc && state.pc.signalingState === 'have-local-offer') {
+      await state.pc.setRemoteDescription(desc);
+    }
+    for (const c of state.pendingCandidates) await state.pc?.addIceCandidate(c).catch(() => {});
+    state.pendingCandidates = [];
     return;
   }
-  setStatus('Собеседник вышел. Ждём, пока он вернётся:', true);
-  if (!state.isHost) {
-    // Ушёл тот, кто занимал комнату, — занимаем её сами и ждём.
-    state.peer?.destroy();
-    setTimeout(joinRoom, 1000);
+
+  if (data.candidate) {
+    if (state.pc?.remoteDescription) await state.pc.addIceCandidate(data.candidate).catch(() => {});
+    else state.pendingCandidates.push(data.candidate);
   }
+}
+
+function closePeer() {
+  clearTimeout(state.disconnectTimer);
+  clearTimeout(state.connectTimer);
+  if (state.pc) {
+    state.pc.ontrack = state.pc.onicecandidate = state.pc.onconnectionstatechange = null;
+    state.pc.close();
+  }
+  state.pc = null;
+  $('remoteVideo').srcObject = null;
+}
+
+function disconnectBrokers() {
+  clearInterval(state.helloTimer);
+  for (const c of state.clients) { try { c.end(true); } catch { /* ignore */ } }
+  state.clients = [];
 }
 
 // ---------- Кнопки ----------
@@ -285,29 +394,19 @@ $('camBtn').onclick = () => {
   updateButtons();
 };
 
-function videoSender() {
-  return state.call?.peerConnection?.getSenders().find(s => s.track?.kind === 'video');
-}
-
 $('screenBtn').onclick = async () => {
   if (state.screenTrack) return stopScreenShare();
-  if (!navigator.mediaDevices?.getDisplayMedia) {
-    return toast('Демонстрация экрана не поддерживается в этом браузере');
-  }
-
   let stream;
   try {
     stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 15 } }, audio: false });
   } catch {
     return; // пользователь отменил выбор
   }
-
   const track = stream.getVideoTracks()[0];
   track.contentHint = 'detail';
   track.onended = stopScreenShare; // нажали «Остановить» в панели браузера
   state.screenTrack = track;
-
-  await videoSender()?.replaceTrack(track);
+  await state.senders.video?.replaceTrack(track);
   showLocal(new MediaStream([track]), false);
   updateButtons();
 };
@@ -317,22 +416,31 @@ async function stopScreenShare() {
   state.screenTrack.onended = null;
   state.screenTrack.stop();
   state.screenTrack = null;
-  await videoSender()?.replaceTrack(currentVideoTrack());
+  await state.senders.video?.replaceTrack(state.camTrack);
   showLocal(state.localStream, true);
   updateButtons();
 }
 
-$('hangupBtn').onclick = () => {
-  state.leaving = true;
-  clearTimeout(state.disconnectTimer);
-  state.call?.close();
-  state.peer?.destroy();
+async function leave() {
+  if (state.stopped && !state.clients.length) return;
+  const wasConnected = !!state.peerId;
+  if (wasConnected) await publish({ type: 'bye' }).catch(() => {});
+  state.stopped = true;
+  closePeer();
+  state.peerId = null;
+  setTimeout(disconnectBrokers, 300); // даём «bye» уйти
   state.screenTrack?.stop();
   state.localStream?.getTracks().forEach(t => t.stop());
-  $('remoteVideo').srcObject = null;
+}
+
+$('hangupBtn').onclick = async () => {
+  await leave();
   $('call').hidden = true;
   $('ended').hidden = false;
 };
+
+// Закрыли вкладку — пробуем предупредить собеседника (если не успеем, он поймёт сам через ~10 секунд).
+window.addEventListener('pagehide', () => { if (state.peerId) leave(); });
 
 $('copyBtn').onclick = async () => {
   try {
@@ -343,6 +451,11 @@ $('copyBtn').onclick = async () => {
   }
   toast('Ссылка скопирована');
 };
+
+if (navigator.share) {
+  $('shareBtn').hidden = false;
+  $('shareBtn').onclick = () => navigator.share({ title: 'Видеозвонок', url: location.href }).catch(() => {});
+}
 
 function updateButtons() {
   $('micBtn').classList.toggle('is-off', !state.micTrack || !state.micTrack.enabled);
@@ -360,10 +473,15 @@ function showLocal(stream, isCamera) {
   v.classList.toggle('screen', !isCamera);
 }
 
+function showWaiting(text = 'Вы в комнате одни. Отправьте ссылку собеседнику:') {
+  setStatus(text, true);
+}
+
 function setStatus(text, withShare = false) {
   $('overlay').hidden = false;
   $('status').textContent = text;
   $('shareBox').hidden = !withShare;
+  $('roomHint').hidden = !withShare;
 }
 
 function hideStatus() {

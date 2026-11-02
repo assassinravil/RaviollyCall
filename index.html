@@ -3,8 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f1115">
   <title>Звонок</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=2">
 </head>
 <body>
   <!-- Экран входа -->
@@ -17,7 +18,8 @@
       </p>
       <button id="createBtn" class="primary">Создать комнату</button>
       <button id="joinBtn" class="primary" hidden>Войти в звонок</button>
-      <a id="newRoomLink" class="link" href="/" hidden>Создать другую комнату</a>
+      <a id="newRoomLink" class="link" href="./" hidden>Создать другую комнату</a>
+      <p class="hint">Комната нигде не хранится и исчезает сама, когда из неё все выйдут.</p>
     </div>
   </section>
 
@@ -30,7 +32,10 @@
       <div id="shareBox" class="share" hidden>
         <input id="shareInput" readonly>
         <button id="copyBtn">Скопировать</button>
+        <button id="shareBtn" hidden>Отправить</button>
       </div>
+      <p id="roomHint" class="hint" hidden>Когда все выйдут, комната исчезнет.</p>
+      <p id="netInfo" class="net"></p>
     </div>
 
     <video id="localVideo" class="mirror" autoplay playsinline muted></video>
@@ -47,7 +52,7 @@
       <button id="screenBtn" class="ctrl" title="Демонстрация экрана">
         <svg viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4M12 13V8M9.5 10.5L12 8l2.5 2.5"/></svg>
       </button>
-      <button id="hangupBtn" class="ctrl danger" title="Завершить">
+      <button id="hangupBtn" class="ctrl danger" title="Выйти из звонка">
         <svg viewBox="0 0 24 24"><path d="M3 15.5c5-4.7 13-4.7 18 0l-2.3 2.3-3.4-1.5v-2.6a11 11 0 0 0-6.6 0v2.6l-3.4 1.5z"/></svg>
       </button>
     </div>
@@ -56,15 +61,17 @@
   <!-- Экран после звонка -->
   <section id="ended" class="screen" hidden>
     <div class="card">
-      <h1>Звонок завершён</h1>
-      <button id="rejoinBtn" class="primary">Вернуться в комнату</button>
-      <a class="link" href="/">На главную</a>
+      <h1>Вы вышли из звонка</h1>
+      <p class="muted">Если в комнате никого не осталось, она уже исчезла — ничего не сохраняется.</p>
+      <button id="newCallBtn" class="primary">Новый звонок</button>
+      <button id="rejoinBtn" class="secondary">Вернуться в эту комнату</button>
     </div>
   </section>
 
   <div id="toast" class="toast" hidden></div>
-  <script src="config.js"></script>
-  <script src="peerjs.min.js"></script>
-  <script src="app.js"></script>
+
+  <script src="config.js?v=2"></script>
+  <script src="mqtt.min.js?v=2"></script>
+  <script src="app.js?v=2"></script>
 </body>
 </html>

@@ -162,3 +162,23 @@ button { font: inherit; cursor: pointer; }
 @media (max-width: 600px) {
   #localVideo { width: 34vw; aspect-ratio: 3 / 4; bottom: 92px; right: 12px; }
 }
+
+.secondary {
+  border: 1px solid #3a3f4a;
+  border-radius: 10px;
+  padding: 11px 16px;
+  background: transparent;
+  color: #e8eaed;
+}
+.secondary:hover { background: #232730; }
+.hint { margin: 0; color: #7d838b; font-size: 13px; line-height: 1.4; }
+.net { margin: 0; color: #5f656d; font-size: 12px; }
+#shareBtn {
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: #2d313a;
+  color: #fff;
+}
+.overlay .hint { font-size: 13px; color: #8a9098; }
+.overlay .net { font-size: 12px; color: #5f656d; }
