@@ -39,6 +39,7 @@ const state = {
   peerId: null,
   pc: null,
   pendingCandidates: [],
+  diag: { local: {}, remote: {} },
   senders: {},
   connectTimer: null,
   disconnectTimer: null,
@@ -190,10 +191,16 @@ function updateNetInfo() {
   if (state.connectedCount && !state.peerId && !state.stopped) showWaiting();
 }
 
-async function publish(msg) {
-  if (!state.key) return;
-  const payload = await encrypt({ ...msg, from: myId, mid: randomId(10) });
-  for (const c of state.clients) if (c.isUp) c.publish(state.topic, payload, { qos: 0 });
+// Отправляем строго по очереди: шифрование асинхронное, и без очереди короткое
+// сообщение могло бы обогнать длинное (например, ICE-кандидат — offer).
+let sendQueue = Promise.resolve();
+function publish(msg) {
+  sendQueue = sendQueue.then(async () => {
+    if (!state.key) return;
+    const payload = await encrypt({ ...msg, from: myId, mid: randomId(10) });
+    for (const c of state.clients) if (c.isUp) c.publish(state.topic, payload, { qos: 0 });
+  }).catch(() => {});
+  return sendQueue;
 }
 
 function onRawMessage(payload) {
@@ -256,20 +263,50 @@ function adoptPeer(id) {
 }
 
 function peerLeft() {
+  clearTimeout(state.connectTimer);
   closePeer();
   state.peerId = null;
+  state.pendingCandidates = [];
+  state.diag = { local: {}, remote: {} };
   showWaiting('Собеседник вышел. Он может вернуться по той же ссылке:');
   sendHello();
 }
 
 function connectFailed() {
+  const report = diagReport();
   closePeer();
   state.peerId = null;
-  setStatus('Не удалось соединиться: сеть одного из вас блокирует звонок. Попробуйте другую сеть (например, мобильный интернет вместо Wi-Fi) и обновите страницу.');
   state.stopped = true;
+  setStatus('Собеседник найден, но соединиться не удалось — сеть мешает прямому соединению.');
+  $('diag').textContent = report;
+  $('diag').hidden = false;
+}
+
+// ---------- Диагностика соединения ----------
+// host — адрес в локальной сети, srflx — внешний адрес (через STUN), relay — через ретранслятор (TURN).
+
+function countCandidate(bucket, line) {
+  const type = /typ (\w+)/.exec(line || '')?.[1];
+  if (type) bucket[type] = (bucket[type] || 0) + 1;
+}
+
+function diagReport() {
+  const fmt = d => `локальная сеть ${d.host ? '✓' : '✗'}, интернет ${d.srflx || d.prflx ? '✓' : '✗'}, ретранслятор ${d.relay ? '✓' : '✗'}`;
+  const lines = [`У вас: ${fmt(state.diag.local)}`, `У собеседника: ${fmt(state.diag.remote)}`];
+  const none = d => !d.host && !d.srflx && !d.prflx && !d.relay;
+  if (none(state.diag.remote)) {
+    lines.push('От собеседника не пришло ни одного адреса — попробуйте обновить страницу у обоих.');
+  } else if (!state.diag.local.relay || !state.diag.remote.relay) {
+    lines.push('Бесплатный ретранслятор недоступен в сети. Помогут: одна Wi-Fi-сеть у обоих, другая сеть или свой TURN-сервер (см. README).');
+  } else {
+    lines.push('Попробуйте другую сеть или свой TURN-сервер (см. README).');
+  }
+  lines.push('Обновите страницу, чтобы попробовать ещё раз.');
+  return lines.join('\n');
 }
 
 function showBusy() {
+  clearTimeout(state.connectTimer);
   closePeer();
   state.peerId = null;
   state.stopped = true;
@@ -284,10 +321,14 @@ function sendSignal(data) {
 // ---------- WebRTC ----------
 
 function createPeer() {
+  // Кандидаты, пришедшие раньше offer (через другой сервер связи), не выбрасываем.
+  const pending = state.pendingCandidates;
+  const remoteTypes = state.diag.remote;
   closePeer();
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
   state.pc = pc;
-  state.pendingCandidates = [];
+  state.pendingCandidates = pending;
+  state.diag = { local: {}, remote: remoteTypes };
   state.senders = {};
 
   const remote = new MediaStream();
@@ -296,7 +337,9 @@ function createPeer() {
     $('remoteVideo').srcObject = remote;
   };
   pc.onicecandidate = e => {
-    if (e.candidate) sendSignal({ candidate: e.candidate.toJSON() });
+    if (!e.candidate) return;
+    countCandidate(state.diag.local, e.candidate.candidate);
+    sendSignal({ candidate: e.candidate.toJSON() });
   };
   pc.onconnectionstatechange = () => {
     if (pc !== state.pc) return;
@@ -358,6 +401,7 @@ async function handleSignal(data) {
   }
 
   if (data.candidate) {
+    countCandidate(state.diag.remote, data.candidate.candidate);
     if (state.pc?.remoteDescription) await state.pc.addIceCandidate(data.candidate).catch(() => {});
     else state.pendingCandidates.push(data.candidate);
   }
@@ -365,7 +409,6 @@ async function handleSignal(data) {
 
 function closePeer() {
   clearTimeout(state.disconnectTimer);
-  clearTimeout(state.connectTimer);
   if (state.pc) {
     state.pc.ontrack = state.pc.onicecandidate = state.pc.onconnectionstatechange = null;
     state.pc.close();
@@ -426,6 +469,7 @@ async function leave() {
   const wasConnected = !!state.peerId;
   if (wasConnected) await publish({ type: 'bye' }).catch(() => {});
   state.stopped = true;
+  clearTimeout(state.connectTimer);
   closePeer();
   state.peerId = null;
   setTimeout(disconnectBrokers, 300); // даём «bye» уйти
