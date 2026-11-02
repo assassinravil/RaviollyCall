@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Звонок</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Экран входа -->
+  <section id="lobby" class="screen">
+    <div class="card">
+      <h1>Видеозвонок</h1>
+      <p id="lobbyText" class="muted">Создайте комнату и отправьте ссылку собеседнику.</p>
+      <p id="secureWarn" class="warn" hidden>
+        Камера и микрофон работают только по HTTPS (или на localhost).
+      </p>
+      <button id="createBtn" class="primary">Создать комнату</button>
+      <button id="joinBtn" class="primary" hidden>Войти в звонок</button>
+      <a id="newRoomLink" class="link" href="/" hidden>Создать другую комнату</a>
+    </div>
+  </section>
+
+  <!-- Экран звонка -->
+  <section id="call" class="screen" hidden>
+    <video id="remoteVideo" autoplay playsinline></video>
+
+    <div id="overlay" class="overlay">
+      <p id="status">Подключаемся…</p>
+      <div id="shareBox" class="share" hidden>
+        <input id="shareInput" readonly>
+        <button id="copyBtn">Скопировать</button>
+      </div>
+    </div>
+
+    <video id="localVideo" class="mirror" autoplay playsinline muted></video>
+
+    <div class="controls">
+      <button id="micBtn" class="ctrl" title="Микрофон">
+        <svg class="on" viewBox="0 0 24 24"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-14 0M12 18v3"/></svg>
+        <svg class="off" viewBox="0 0 24 24"><path d="M3 3l18 18M9 9v3a3 3 0 0 0 5.1 2.1M15 9.3V6a3 3 0 0 0-5.9-.8"/><path d="M17 16.9A7 7 0 0 1 5 11m14 0a7 7 0 0 1-.4 2.3M12 18v3"/></svg>
+      </button>
+      <button id="camBtn" class="ctrl" title="Камера">
+        <svg class="on" viewBox="0 0 24 24"><path d="M15 10l5-3v10l-5-3z"/><rect x="3" y="6" width="12" height="12" rx="2"/></svg>
+        <svg class="off" viewBox="0 0 24 24"><path d="M3 3l18 18M15 10l5-3v10l-3.5-2.1M11 6h2a2 2 0 0 1 2 2v2M15 15v1a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h1"/></svg>
+      </button>
+      <button id="screenBtn" class="ctrl" title="Демонстрация экрана">
+        <svg viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4M12 13V8M9.5 10.5L12 8l2.5 2.5"/></svg>
+      </button>
+      <button id="hangupBtn" class="ctrl danger" title="Завершить">
+        <svg viewBox="0 0 24 24"><path d="M3 15.5c5-4.7 13-4.7 18 0l-2.3 2.3-3.4-1.5v-2.6a11 11 0 0 0-6.6 0v2.6l-3.4 1.5z"/></svg>
+      </button>
+    </div>
+  </section>
+
+  <!-- Экран после звонка -->
+  <section id="ended" class="screen" hidden>
+    <div class="card">
+      <h1>Звонок завершён</h1>
+      <button id="rejoinBtn" class="primary">Вернуться в комнату</button>
+      <a class="link" href="/">На главную</a>
+    </div>
+  </section>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="config.js"></script>
+  <script src="peerjs.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
